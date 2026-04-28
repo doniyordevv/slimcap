@@ -1,0 +1,14 @@
+// Mirror of foxglove/schemas/proto/foxglove/CompressedImage.proto.
+// Used only for reading inputs that carry this schema (sample_microagi style).
+syntax = "proto3";
+
+package foxglove;
+
+import "google/protobuf/timestamp.proto";
+
+message CompressedImage {
+  google.protobuf.Timestamp timestamp = 1;
+  string frame_id = 2;
+  bytes data = 3;
+  string format = 4;
+}

@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+
+# Local environment overrides
+.env
+.envrc
+
+# Editor / OS scratch
+.idea/
+.vscode/
+.DS_Store
+*~

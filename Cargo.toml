@@ -1,0 +1,39 @@
+[package]
+name = "slimcap"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Streaming MCAP slimmer: auto-detects color image topics in robotics logs and re-encodes them to H.264 inside foxglove.CompressedVideo."
+repository = "https://github.com/doniyordevv/slimcap"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["mcap", "ros2", "foxglove", "h264", "transcode"]
+categories = ["command-line-utilities", "multimedia::video", "science::robotics"]
+exclude = [
+    "/.github",
+    "/tools",
+    "/proto",
+    "/sample_*",
+]
+
+[[bin]]
+name = "slimcap"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+camino = "1"
+clap = { version = "4", features = ["derive"] }
+ffmpeg-next = { version = "8", default-features = false, features = ["codec", "format", "software-scaling", "software-resampling"] }
+mcap = "0.24"
+memmap2 = "0.9"
+prost = "0.13"
+prost-types = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"

@@ -1,0 +1,44 @@
+// Mirror of foxglove/schemas/proto/foxglove/CompressedVideo.proto.
+// Wire-compatible with Foxglove Studio's built-in schema.
+syntax = "proto3";
+
+package foxglove;
+
+import "google/protobuf/timestamp.proto";
+
+// A single frame of a compressed video bitstream.
+message CompressedVideo {
+  // Timestamp of the video frame.
+  google.protobuf.Timestamp timestamp = 1;
+
+  // Frame of reference for the video.
+  string frame_id = 2;
+
+  // Compressed video frame data.
+  //
+  // For packet-based video codecs this data must begin and end on packet
+  // boundaries (no partial packets), and must contain enough video packets to
+  // decode exactly one image (either a keyframe or delta frame). Note: Foxglove
+  // does not support video streams that include B frames because they require
+  // lookahead.
+  //
+  // Specifically, the requirements for different `format` values are:
+  //
+  // - `h264`
+  //   - Use Annex B formatted data
+  //   - Each CompressedVideo message should contain enough NAL units to decode
+  //     exactly one video frame
+  //   - Each message containing a key frame (IDR) must also include a SPS NAL
+  //     unit
+  bytes data = 3;
+
+  // Video format.
+  //
+  // Supported values: `h264`, `h265`, `vp9`, `av1`.
+  //
+  // Note: compressed video support is subject to hardware limitations and
+  // patent licensing, so not all encodings may be supported on all platforms.
+  // See more about H.265 support at https://caniuse.com/hevc, VP9 at
+  // https://caniuse.com/webm, and AV1 at https://caniuse.com/av1.
+  string format = 4;
+}
