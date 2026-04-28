@@ -1,10 +1,11 @@
 # slimcap
 
-A streaming MCAP slimmer. Walks an input MCAP, auto-detects color image
-topics (JPEG inside `sensor_msgs/CompressedImage` or `foxglove.CompressedImage`),
-and re-encodes them to H.264 inside `foxglove.CompressedVideo`. Everything
-else — IMU, TF, odom, depth, camera_info, custom messages — is passed through
-byte-for-byte.
+**slimcap compresses MCAP files to make them smaller.**
+
+It walks an input MCAP, auto-detects color image topics (JPEG inside
+`sensor_msgs/CompressedImage` or `foxglove.CompressedImage`), and re-encodes
+them to H.264 inside `foxglove.CompressedVideo`. Everything else — IMU, TF,
+odom, depth, camera_info, custom messages — is passed through byte-for-byte.
 
 Typical result on a multi-camera teleop bag: **6.5 GiB → 2.0 GiB (~69 % smaller)**
 with no perceptible quality loss (CRF 20, libx264 preset=medium).
