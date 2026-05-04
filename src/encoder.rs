@@ -1,8 +1,8 @@
-//! Per-topic JPEG→H.264 re-encoder with variable-frame-rate pts.
+//! Per-topic JPEG→H.264/H.265 re-encoder with variable-frame-rate pts.
 //!
 //! Each [`TopicEncoder`] holds its own MJPEG decoder, swscale context, and
-//! libx264 encoder. libx264 keeps per-stream reference pictures, so frames
-//! from different cameras must not share an encoder.
+//! libx264/libx265 encoder. The video encoders keep per-stream reference
+//! pictures, so frames from different cameras must not share an encoder.
 //!
 //! Timing model:
 //!
@@ -13,8 +13,13 @@
 //!   manually whenever `log_time - last_idr_log_time >= keyframe_interval`.
 //!   That guarantees GOP boundaries fall at fixed wall-clock intervals
 //!   regardless of frame rate jitter.
+//! - With B-frames enabled, libx264/libx265 emit packets in decode order,
+//!   not display order. We hold the most recent `bframes` packets in a
+//!   per-topic `BTreeMap` keyed on PTS and release the smallest first, so
+//!   MCAP messages on each topic stay monotonic in `log_time` (what indexers
+//!   and `MessageStream` expect).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use ffmpeg_next as ff;
@@ -27,10 +32,64 @@ use ff::util::rational::Rational;
 const TIME_BASE_NUM: i32 = 1;
 const TIME_BASE_DEN: i32 = 1_000_000; // 1 µs
 
+/// Output video codec. Determines the libavcodec encoder name, the
+/// codec-specific params string, and the `format` field on the emitted
+/// `foxglove.CompressedVideo` message.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum Codec {
+    #[clap(name = "h264")]
+    H264,
+    #[clap(name = "h265")]
+    H265,
+}
+
+impl Codec {
+    pub fn ffmpeg_encoder_name(self) -> &'static str {
+        match self {
+            Codec::H264 => "libx264",
+            Codec::H265 => "libx265",
+        }
+    }
+
+    /// Value for the `format` field on `foxglove.CompressedVideo`.
+    pub fn foxglove_format(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264",
+            Codec::H265 => "h265",
+        }
+    }
+
+    fn x_params_key(self) -> &'static str {
+        match self {
+            Codec::H264 => "x264-params",
+            Codec::H265 => "x265-params",
+        }
+    }
+
+    /// Codec-specific options bundle. Both strings disable the encoder's own
+    /// keyframe cadence (we force IDRs manually from `log_time`) and ensure
+    /// each IDR is a self-contained random-access point with parameter sets
+    /// inline — required for Foxglove's single-message playback model.
+    fn x_params_value(self) -> &'static str {
+        match self {
+            Codec::H264 => "repeat-headers=1:annexb=1:keyint=9999:min-keyint=1:scenecut=0",
+            // libx265 emits Annex-B by default through libavcodec (no annexb opt).
+            // no-open-gop=1 closes the GOP at every IDR so B-frames never reach
+            // back across the boundary.
+            Codec::H265 => "repeat-headers=1:keyint=9999:min-keyint=1:scenecut=0:no-open-gop=1",
+        }
+    }
+}
+
+impl std::fmt::Display for Codec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.foxglove_format())
+    }
+}
+
 /// Metadata we need to emit one output message, keyed on the pts we handed to
-/// the encoder. libx264 with `max_b_frames=0` buffers at most one frame, so
-/// this map stays small, but it is needed because packets may come back one
-/// call later than the frame we pushed.
+/// the encoder. The map is needed because packets may come back several calls
+/// later than the frame we pushed (lookahead + B-frame reordering).
 #[derive(Debug, Clone)]
 pub struct FrameMeta {
     pub log_time: u64,
@@ -53,10 +112,16 @@ pub struct EncodedPacket {
 pub struct TopicEncoder {
     jpeg_decoder: ff::codec::decoder::Video,
     encoder: Option<EncoderState>,
+    codec: Codec,
     crf: u32,
     preset: String,
+    bframes: u32,
     keyframe_interval_ns: i64,
     pending: HashMap<i64, FrameMeta>,
+    /// Output reorder buffer. libx264 hands back packets in decode order, but
+    /// we want to write the MCAP per-topic in display/PTS order so log_time is
+    /// monotonic. Holds the most recent `bframes` packets in steady state.
+    reorder: BTreeMap<i64, EncodedPacket>,
 
     start_log_ns: Option<u64>,
     last_idr_log_ns: Option<u64>,
@@ -74,7 +139,13 @@ struct EncoderState {
 }
 
 impl TopicEncoder {
-    pub fn new(crf: u32, preset: &str, keyframe_interval_seconds: f64) -> Result<Self> {
+    pub fn new(
+        codec: Codec,
+        crf: u32,
+        preset: &str,
+        keyframe_interval_seconds: f64,
+        bframes: u32,
+    ) -> Result<Self> {
         let dec_codec = ff::codec::decoder::find(Id::MJPEG)
             .ok_or_else(|| anyhow!("libavcodec has no MJPEG decoder"))?;
         let dec_ctx = ff::codec::context::Context::new_with_codec(dec_codec);
@@ -88,10 +159,13 @@ impl TopicEncoder {
         Ok(Self {
             jpeg_decoder,
             encoder: None,
+            codec,
             crf,
             preset: preset.to_string(),
+            bframes,
             keyframe_interval_ns,
             pending: HashMap::new(),
+            reorder: BTreeMap::new(),
             start_log_ns: None,
             last_idr_log_ns: None,
             last_pts_us: None,
@@ -205,9 +279,8 @@ impl TopicEncoder {
     }
 
     fn drain(&mut self, flush: bool) -> Result<Vec<EncodedPacket>> {
-        let mut out = Vec::new();
         let Some(state) = self.encoder.as_mut() else {
-            return Ok(out);
+            return Ok(Vec::new());
         };
         loop {
             let mut packet = ff::codec::packet::Packet::empty();
@@ -219,7 +292,7 @@ impl TopicEncoder {
                         .remove(&pts)
                         .ok_or_else(|| anyhow!("no pending meta for pts {}", pts))?;
                     let data = packet.data().unwrap_or_default().to_vec();
-                    out.push(EncodedPacket { meta, data });
+                    self.reorder.insert(pts, EncodedPacket { meta, data });
                 }
                 Err(ff::Error::Other { errno })
                     if errno == ff::error::EAGAIN.into() =>
@@ -230,6 +303,18 @@ impl TopicEncoder {
                 Err(e) => return Err(e).context("receive_packet"),
             }
         }
+
+        // libx264's PTS-vs-DTS reorder window is bounded by `bframes`. Once
+        // the buffer holds more than that, the smallest-PTS entry is committed:
+        // no future packet can carry a smaller PTS. On flush we release
+        // everything since no more frames will arrive.
+        let hold = if flush { 0 } else { self.bframes as usize };
+        let mut out = Vec::new();
+        while self.reorder.len() > hold {
+            let (_, pkt) = self.reorder.pop_first().unwrap();
+            out.push(pkt);
+        }
+
         if flush && !self.pending.is_empty() {
             tracing::warn!(
                 pending = self.pending.len(),
@@ -258,8 +343,9 @@ impl TopicEncoder {
             bail!("yuv420p requires even width and height, got {}x{}", w, h);
         }
 
-        let enc_codec = ff::codec::encoder::find_by_name("libx264")
-            .ok_or_else(|| anyhow!("libavcodec has no libx264 encoder"))?;
+        let codec_name = self.codec.ffmpeg_encoder_name();
+        let enc_codec = ff::codec::encoder::find_by_name(codec_name)
+            .ok_or_else(|| anyhow!("libavcodec has no {codec_name} encoder"))?;
 
         let enc_ctx = ff::codec::context::Context::new_with_codec(enc_codec);
         let mut enc = enc_ctx.encoder().video()?;
@@ -267,26 +353,20 @@ impl TopicEncoder {
         enc.set_height(h);
         enc.set_format(Pixel::YUV420P);
         enc.set_time_base(Rational(TIME_BASE_NUM, TIME_BASE_DEN));
-        enc.set_max_b_frames(0);
+        enc.set_max_b_frames(self.bframes as usize);
         // Nominal framerate — CRF encoding largely ignores this, but some rate-
         // control heuristics read it. 30 is a reasonable prior for all sensor
-        // streams we've seen; pts differences give x264 the actual durations.
+        // streams we've seen; pts differences give the encoder the actual durations.
         enc.set_frame_rate(Some(Rational(30, 1)));
 
         let mut opts = ff::Dictionary::new();
         opts.set("preset", &self.preset);
         opts.set("crf", &self.crf.to_string());
-        // - repeat-headers=1:annexb=1  → Foxglove wire format (SPS/PPS on every IDR,
-        //   Annex-B start codes).
-        // - keyint=9999:min-keyint=1   → disable x264's auto-keyframe cadence; we
-        //   force IDRs manually from log_time deltas (see push_frame above).
-        // - scenecut=0                 → and no keyframe insertion on scene changes.
-        opts.set(
-            "x264-params",
-            "repeat-headers=1:annexb=1:keyint=9999:min-keyint=1:scenecut=0",
-        );
+        opts.set(self.codec.x_params_key(), self.codec.x_params_value());
 
-        let enc = enc.open_with(opts).context("open libx264 encoder")?;
+        let enc = enc
+            .open_with(opts)
+            .with_context(|| format!("open {codec_name} encoder"))?;
 
         Ok(EncoderState {
             enc,

@@ -15,7 +15,7 @@ use prost::Message as _;
 use crate::cdr::{self, ImageFields};
 use crate::cli::Args;
 use crate::detect::{classify_first_message, ImageSchema, TopicKind};
-use crate::encoder::{EncodedPacket, FrameMeta, TopicEncoder};
+use crate::encoder::{Codec, EncodedPacket, FrameMeta, TopicEncoder};
 use crate::pb;
 
 pub fn run(args: Args) -> Result<()> {
@@ -47,10 +47,15 @@ pub fn run(args: Args) -> Result<()> {
         .with_context(|| format!("create output: {}", args.output))?;
     let out_file = BufWriter::with_capacity(4 * 1024 * 1024, out_file);
 
+    let library = format!(
+        "slimcap/{}+{}",
+        env!("CARGO_PKG_VERSION"),
+        args.codec.foxglove_format()
+    );
     let mut writer = WriteOptions::new()
         .compression(Some(mcap::Compression::Zstd))
         .profile(profile)
-        .library("slimcap/0.1.0+h264")
+        .library(&library)
         .create(out_file)?;
 
     // Register the foxglove.CompressedVideo schema once — shared across all
@@ -177,9 +182,11 @@ pub fn run(args: Args) -> Result<()> {
 
             if let TopicKind::Color { input_schema } = &resolved {
                 let enc = TopicEncoder::new(
+                    args.codec,
                     args.crf,
                     &args.preset,
                     args.keyframe_interval_seconds,
+                    args.bframes,
                 )?;
                 state.encoder = Some(enc);
 
@@ -215,7 +222,8 @@ pub fn run(args: Args) -> Result<()> {
                 tracing::info!(
                     topic = %state.topic,
                     schema = %state.in_schema_name,
-                    "classified as color → H.264"
+                    codec = %args.codec,
+                    "classified as color → re-encode"
                 );
             } else {
                 tracing::info!(
@@ -284,7 +292,7 @@ pub fn run(args: Args) -> Result<()> {
                 let packets = encoder.push_frame(&jpeg_bytes, meta)?;
                 for pkt in packets {
                     color_out_bytes += pkt.data.len() as u64;
-                    emit_video_packet(&mut writer, out_channel_id, &pkt)?;
+                    emit_video_packet(&mut writer, out_channel_id, &pkt, args.codec)?;
                     color_msgs += 1;
                 }
             }
@@ -312,7 +320,7 @@ pub fn run(args: Args) -> Result<()> {
             let out_channel_id = state.out_channel_id.unwrap();
             for pkt in packets {
                 color_out_bytes += pkt.data.len() as u64;
-                emit_video_packet(&mut writer, out_channel_id, &pkt)?;
+                emit_video_packet(&mut writer, out_channel_id, &pkt, args.codec)?;
                 tail_color += 1;
             }
         }
@@ -369,6 +377,7 @@ fn emit_video_packet<W: Write + Seek>(
     writer: &mut Writer<W>,
     channel_id: u16,
     pkt: &EncodedPacket,
+    codec: Codec,
 ) -> Result<()> {
     let msg = pb::foxglove::CompressedVideo {
         timestamp: Some(prost_types::Timestamp {
@@ -377,7 +386,7 @@ fn emit_video_packet<W: Write + Seek>(
         }),
         frame_id: pkt.meta.frame_id.clone(),
         data: pkt.data.clone(),
-        format: "h264".to_string(),
+        format: codec.foxglove_format().to_string(),
     };
     let mut buf = Vec::with_capacity(msg.encoded_len());
     msg.encode(&mut buf)?;
