@@ -2,6 +2,7 @@ mod cdr;
 mod cli;
 mod detect;
 mod encoder;
+mod ordered;
 mod pb;
 mod pipeline;
 
