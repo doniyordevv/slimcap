@@ -13,13 +13,17 @@
 //!   manually whenever `log_time - last_idr_log_time >= keyframe_interval`.
 //!   That guarantees GOP boundaries fall at fixed wall-clock intervals
 //!   regardless of frame rate jitter.
-//! - With B-frames enabled, libx264/libx265 emit packets in decode order,
-//!   not display order. We hold the most recent `bframes` packets in a
-//!   per-topic `BTreeMap` keyed on PTS and release the smallest first, so
-//!   MCAP messages on each topic stay monotonic in `log_time` (what indexers
-//!   and `MessageStream` expect).
+//! - libx264/libx265 hand back packets in **decode order**. We emit them in
+//!   exactly that order: a coded bitstream is only decodable in decode order,
+//!   and `foxglove.CompressedVideo` consumers (Foxglove, WebCodecs, ffmpeg on
+//!   the raw stream) decode messages in the order they appear. Each packet
+//!   still carries its source frame's original `log_time` (looked up via the
+//!   `pending` pts->meta map). With the default `bframes = 0`, decode order ==
+//!   display order == capture order, so per-topic `log_time` is also
+//!   monotonic; with B-frames it is not (that is inherent to the codec, hence
+//!   `bframes` defaults to 0 — see `cli`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use ffmpeg_next as ff;
@@ -117,11 +121,10 @@ pub struct TopicEncoder {
     preset: String,
     bframes: u32,
     keyframe_interval_ns: i64,
+    /// pts -> source-frame metadata. A packet can come back several
+    /// `receive_packet` calls after the frame was pushed (lookahead + B-frame
+    /// reorder), so we hold each frame's meta until its packet emerges.
     pending: HashMap<i64, FrameMeta>,
-    /// Output reorder buffer. libx264 hands back packets in decode order, but
-    /// we want to write the MCAP per-topic in display/PTS order so log_time is
-    /// monotonic. Holds the most recent `bframes` packets in steady state.
-    reorder: BTreeMap<i64, EncodedPacket>,
 
     start_log_ns: Option<u64>,
     last_idr_log_ns: Option<u64>,
@@ -165,7 +168,6 @@ impl TopicEncoder {
             bframes,
             keyframe_interval_ns,
             pending: HashMap::new(),
-            reorder: BTreeMap::new(),
             start_log_ns: None,
             last_idr_log_ns: None,
             last_pts_us: None,
@@ -282,6 +284,11 @@ impl TopicEncoder {
         let Some(state) = self.encoder.as_mut() else {
             return Ok(Vec::new());
         };
+        // Emit packets in the order libx264/libx265 produces them — decode
+        // order — because that is the only order a coded bitstream is
+        // decodable in. Each packet still carries its source frame's original
+        // log_time via the pts->meta lookup, so timestamps remain faithful.
+        let mut out = Vec::new();
         loop {
             let mut packet = ff::codec::packet::Packet::empty();
             match state.enc.receive_packet(&mut packet) {
@@ -292,7 +299,7 @@ impl TopicEncoder {
                         .remove(&pts)
                         .ok_or_else(|| anyhow!("no pending meta for pts {}", pts))?;
                     let data = packet.data().unwrap_or_default().to_vec();
-                    self.reorder.insert(pts, EncodedPacket { meta, data });
+                    out.push(EncodedPacket { meta, data });
                 }
                 Err(ff::Error::Other { errno })
                     if errno == ff::error::EAGAIN.into() =>
@@ -302,17 +309,6 @@ impl TopicEncoder {
                 Err(ff::Error::Eof) => break,
                 Err(e) => return Err(e).context("receive_packet"),
             }
-        }
-
-        // libx264's PTS-vs-DTS reorder window is bounded by `bframes`. Once
-        // the buffer holds more than that, the smallest-PTS entry is committed:
-        // no future packet can carry a smaller PTS. On flush we release
-        // everything since no more frames will arrive.
-        let hold = if flush { 0 } else { self.bframes as usize };
-        let mut out = Vec::new();
-        while self.reorder.len() > hold {
-            let (_, pkt) = self.reorder.pop_first().unwrap();
-            out.push(pkt);
         }
 
         if flush && !self.pending.is_empty() {

@@ -43,11 +43,24 @@ pub struct Args {
     #[arg(long, default_value_t = 5.0)]
     pub keyframe_interval_seconds: f64,
 
-    /// Maximum consecutive B-frames the encoder may insert between anchors. Higher values
-    /// give better compression at the cost of a slightly larger reorder window and a
-    /// small encode-speed hit. 0 disables B-frames entirely.
-    #[arg(long, default_value_t = 3)]
+    /// Maximum consecutive B-frames the encoder may insert between anchors. Default 0.
+    /// IMPORTANT: with B-frames, codec decode order != display order, so the emitted
+    /// bitstream is only decodable by consumers that buffer and reorder by DTS. slimcap
+    /// emits packets in decode order; consumers that decode `foxglove.CompressedVideo`
+    /// messages linearly in log_time order (Foxglove, ffmpeg on the raw stream) will see
+    /// broken references unless this is 0. Only raise it if every downstream decoder is
+    /// DTS-aware. Higher values give ~5-15% smaller files.
+    #[arg(long, default_value_t = 0)]
     pub bframes: u32,
+
+    /// Output reorder window in seconds. The encoder emits a frame's packet several
+    /// frames after it was pushed (lookahead + thread + B-frame latency), so video
+    /// packets lag the zero-latency passthrough stream. Buffered output is held this
+    /// long (by log_time) before being flushed, so the written MCAP stays monotonic in
+    /// log_time and `mcap doctor`-clean. Must exceed the encoder's emit latency; larger
+    /// = more transient memory.
+    #[arg(long, default_value_t = 3.0)]
+    pub reorder_window_seconds: f64,
 
     /// Stop after this many seconds of input (by log_time). Useful for dev iteration.
     #[arg(long)]

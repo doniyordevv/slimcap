@@ -53,8 +53,9 @@ Common options:
 | `--crf <N>` | 20 | Encoder CRF. 18 = visually transparent. 23 ≈ 35 % smaller files but JPEG-era artifacts return. libx265's CRF scale is shifted ~5-6 lower than libx264 — bump CRF when switching to h265 if you want comparable file sizes rather than comparable quality. |
 | `--preset <NAME>` | `medium` | Encoder preset. `slow` for ~10 % smaller output, much slower encode. Same name space for x264 and x265. |
 | `--keyframe-interval-seconds <S>` | 5.0 | Wall-clock IDR cadence (uses the message `log_time`, not a frame counter, so VFR streams stay aligned). Longer = smaller files, slower scrubbing. |
-| `--bframes <N>` | 3 | Max consecutive B-frames between anchors. 0 disables; higher values trade a slightly larger reorder window for better compression. |
-| `--limit-seconds <S>` | — | Stop after N seconds of input. Useful for dev iteration. |
+| `--bframes <N>` | 0 | Max consecutive B-frames. **Default 0 on purpose:** with B-frames the codec's decode order ≠ display order, and `foxglove.CompressedVideo` consumers (Foxglove, WebCodecs, ffmpeg on the raw stream) decode messages in arrival order — so a B-frame stream is undecodable unless every downstream decoder is DTS-aware. Raising it yields ~5-15 % smaller files but breaks linear decoding. |
+| `--reorder-window-seconds <S>` | 3.0 | Output reorder buffer span. The encoder emits a frame's packet several frames late (lookahead/threads), so video lags the zero-latency passthrough stream; output is buffered this long by `log_time` so the written MCAP stays monotonic and `mcap doctor`-clean. Must exceed encoder emit latency; larger = more transient memory. |
+| `--limit-seconds <S>` | — | Stop after N seconds of input (by `log_time`). Useful for dev iteration. |
 | `--skip <TOPIC>` | — | Force a topic to passthrough even if auto-detection picks it as color. Repeatable. |
 | `--force-color <TOPIC>` | — | Force a topic into the color path. Repeatable. |
 | `--progress-every <N>` | 2000 | Print a progress line every N input messages. |

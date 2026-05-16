@@ -10,3 +10,7 @@
 .vscode/
 .DS_Store
 *~
+
+# Local test data / large artifacts (downloaded bags, transcoder output)
+*.mcap
+/metadata.json
